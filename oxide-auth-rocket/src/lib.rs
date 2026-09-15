@@ -6,13 +6,13 @@ mod failure;
 use std::io::Cursor;
 use std::marker::PhantomData;
 
-use rocket::{Data, Request, Response};
-use rocket::http::{ContentType, Status};
 use rocket::http::hyper::header;
-use rocket::request::FromRequest;
+use rocket::http::{ContentType, Header, Status};
+use rocket::request::{Outcome, FromRequest};
 use rocket::response::{self, Responder};
-use rocket::outcome::Outcome;
-
+use rocket::{async_trait, Data, Request, Response};
+use rocket::data::ToByteUnit;
+use rocket::http::hyper::body::Buf;
 use oxide_auth::endpoint::{NormalizedParameter, WebRequest, WebResponse};
 use oxide_auth::frontends::dev::*;
 
@@ -58,8 +58,8 @@ impl<'r> OAuthRequest<'r> {
     /// Create the request data from request headers.
     ///
     /// Some oauth methods need additionally the body data which you can attach later.
-    pub fn new<'a>(request: &'a Request<'r>) -> Self {
-        let query = request.uri().query().unwrap_or("");
+    pub fn new(request: &Request<'_>) -> Self {
+        let query = request.uri().query().map_or("", |x| x.as_str());
         let query = match serde_urlencoded::from_str(query) {
             Ok(query) => Ok(query),
             Err(_) => Err(WebError::Encoding),
@@ -94,14 +94,24 @@ impl<'r> OAuthRequest<'r> {
     /// simplify the implementation of primitives and handlers, this type is the central request
     /// type for both these use cases. When you forget to provide the body to a request, the oauth
     /// system will return an error the moment the request is used.
-    pub fn add_body(&mut self, data: Data) {
+    pub async fn add_body(&mut self, data: Data<'_>) {
         // Nothing to do if we already have a body, or already generated an error. This includes
         // the case where the content type does not indicate a form, as the error is silent until a
         // body is explicitely requested.
         if let Ok(None) = self.body {
-            match serde_urlencoded::from_reader(data.open()) {
-                Ok(query) => self.body = Ok(Some(query)),
-                Err(_) => self.body = Err(WebError::Encoding),
+            match data.open(32.kibibytes()).into_bytes().await {
+                Ok(bytes) if bytes.is_complete() => {
+                    match serde_urlencoded::from_reader(bytes.reader()) {
+                        Ok(query) => self.body = Ok(Some(query)),
+                        Err(_) => self.body = Err(WebError::Encoding),
+                    }
+                }
+                Ok(_) => {
+                    self.body = Err(WebError::BodyNeeded);
+                }
+                Err(_) => {
+                    self.body = Err(WebError::BodyNeeded);
+                }
             }
         }
     }
@@ -123,14 +133,14 @@ impl<'r> WebRequest for OAuthRequest<'r> {
     type Error = WebError;
     type Response = OAuthResponse<'r>;
 
-    fn query(&mut self) -> Result<Cow<dyn QueryParameter + 'static>, Self::Error> {
+    fn query(&mut self) -> Result<Cow<'_, dyn QueryParameter + 'static>, Self::Error> {
         match self.query.as_ref() {
             Ok(query) => Ok(Cow::Borrowed(query as &dyn QueryParameter)),
             Err(err) => Err(*err),
         }
     }
 
-    fn urlbody(&mut self) -> Result<Cow<dyn QueryParameter + 'static>, Self::Error> {
+    fn urlbody(&mut self) -> Result<Cow<'_, dyn QueryParameter + 'static>, Self::Error> {
         match self.body.as_ref() {
             Ok(None) => Err(WebError::BodyNeeded),
             Ok(Some(body)) => Ok(Cow::Borrowed(body as &dyn QueryParameter)),
@@ -138,7 +148,7 @@ impl<'r> WebRequest for OAuthRequest<'r> {
         }
     }
 
-    fn authheader(&mut self) -> Result<Option<Cow<str>>, Self::Error> {
+    fn authheader(&mut self) -> Result<Option<Cow<'_, str>>, Self::Error> {
         Ok(self.auth.as_ref().map(String::as_str).map(Cow::Borrowed))
     }
 }
@@ -153,7 +163,8 @@ impl<'r> WebResponse for OAuthResponse<'r> {
 
     fn redirect(&mut self, url: Url) -> Result<(), Self::Error> {
         self.0.set_status(Status::Found);
-        self.0.set_header(header::Location(url.into()));
+        self.0
+            .set_header(Header::new(header::LOCATION.as_str(), url.to_string()));
         Ok(())
     }
 
@@ -169,34 +180,35 @@ impl<'r> WebResponse for OAuthResponse<'r> {
     }
 
     fn body_text(&mut self, text: &str) -> Result<(), Self::Error> {
-        self.0.set_sized_body(Cursor::new(text.to_owned()));
+        self.0.set_sized_body(text.len(), Cursor::new(text.to_owned()));
         self.0.set_header(ContentType::Plain);
         Ok(())
     }
 
     fn body_json(&mut self, data: &str) -> Result<(), Self::Error> {
-        self.0.set_sized_body(Cursor::new(data.to_owned()));
+        self.0.set_sized_body(data.len(), Cursor::new(data.to_owned()));
         self.0.set_header(ContentType::JSON);
         Ok(())
     }
 }
 
-impl<'a, 'r> FromRequest<'a, 'r> for OAuthRequest<'r> {
+#[async_trait]
+impl<'r> FromRequest<'r> for OAuthRequest<'r> {
     type Error = NoError;
 
-    fn from_request(request: &'a Request<'r>) -> Outcome<Self, (Status, Self::Error), ()> {
+    async fn from_request(request: &'r Request<'_>) -> Outcome<Self, Self::Error> {
         Outcome::Success(Self::new(request))
     }
 }
 
-impl<'r> Responder<'r> for OAuthResponse<'r> {
-    fn respond_to(self, _: &Request) -> response::Result<'r> {
+impl<'r, 'o: 'r> Responder<'r, 'o> for OAuthResponse<'o> {
+    fn respond_to(self, _: &'r Request<'_>) -> response::Result<'o> {
         Ok(self.0)
     }
 }
 
-impl<'r> Responder<'r> for WebError {
-    fn respond_to(self, _: &Request) -> response::Result<'r> {
+impl<'r, 'o: 'r> Responder<'r, 'o> for WebError {
+    fn respond_to(self, _: &'r Request<'_>) -> response::Result<'o> {
         match self {
             WebError::Encoding => Err(Status::BadRequest),
             WebError::NotAForm => Err(Status::BadRequest),
