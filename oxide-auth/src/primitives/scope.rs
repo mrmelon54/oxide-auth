@@ -96,6 +96,11 @@ impl Scope {
     pub fn iter(&self) -> impl Iterator<Item = &str> {
         self.tokens.iter().map(AsRef::as_ref)
     }
+
+    /// Provides access to the internal HashSet
+    pub fn as_set(&self) -> &HashSet<String> {
+        &self.tokens
+    }
 }
 
 /// Error returned from parsing a scope as encoded in an authorization token request.
