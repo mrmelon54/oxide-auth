@@ -70,6 +70,12 @@ impl<'de> Deserialize<'de> for Scope {
 }
 
 impl Scope {
+    fn new() -> Scope {
+        Scope {
+            tokens: HashSet::new(),
+        }
+    }
+
     fn invalid_scope_char(ch: char) -> bool {
         match ch {
             '\x21' => false,
@@ -98,8 +104,22 @@ impl Scope {
     }
 
     /// Provides access to the internal HashSet
-    pub fn as_set(&self) -> &HashSet<String> {
-        &self.tokens
+    pub fn intersection(&self, other: &Scope) -> Scope {
+        Scope {
+            tokens: self.tokens.intersection(&other.tokens).cloned().collect(),
+        }
+    }
+
+    /// Parse scopes from a &str iterator
+    pub fn parse_iter(scope: impl IntoIterator<Item = impl AsRef<str>>) -> Result<Scope, ParseScopeErr> {
+        scope
+            .into_iter()
+            .map(|x| x.as_ref().parse::<Scope>())
+            .fold(Ok(Scope::new()), |a, b| {
+                Ok(Scope {
+                    tokens: a?.tokens.union(&b?.tokens).cloned().collect(),
+                })
+            })
     }
 }
 
